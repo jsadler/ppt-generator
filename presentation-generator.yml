@@ -1,0 +1,402 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: 'AI Presentation Generator Stack'
+
+Parameters:
+  FrontendBucketName:
+    Type: String
+    Description: Name for the S3 bucket hosting the frontend
+    Default: 'ppt-generator-frontend'
+  StorageBucketName:
+    Type: String
+    Description: Name for the S3 bucket storing generated presentations
+    Default: 'ppt-generator-storage'
+  LambdaRuntimePythonVersion:
+    Type: String
+    Default: python3.11
+    Description: Python runtime version for Lambda function
+
+
+Resources:
+  # Frontend S3 Bucket
+  FrontendBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-${AWS::Region}-${FrontendBucketName}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+
+  # Storage S3 Bucket
+  StorageBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-${AWS::Region}-${StorageBucketName}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: ['GET', 'PUT', 'POST', 'HEAD']
+            AllowedOrigins: ['*']
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+
+  # CloudFront Origin Access Control
+  CloudFrontOriginAccessControl:
+    Type: 'AWS::CloudFront::OriginAccessControl'
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${FrontendBucketName}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: 'AWS::CloudFront::Distribution'
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            Id: S3Origin
+            OriginAccessControlId: !GetAtt CloudFrontOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        Enabled: true
+        DefaultRootObject: index.html
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # Managed-CachingOptimized
+          Compress: true
+
+  # Frontend Bucket Policy
+  FrontendBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution.Id}'
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: S3AndBedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${StorageBucket.Arn}/*'
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: '*'
+
+  # Lambda Function
+  PresentationGeneratorFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: PresentationGenerator
+      Runtime: !Ref LambdaRuntimePythonVersion
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import logging
+          import boto3
+          from pptx import Presentation
+          from pptx.util import Inches, Pt
+          from pptx.enum.text import PP_ALIGN
+          import io
+          from datetime import datetime
+          import base64
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize AWS clients
+          bedrock = boto3.client('bedrock-runtime')
+          s3 = boto3.client('s3')
+
+          def generate_presentation_content(topic, num_slides):
+              """Generate presentation content using Bedrock"""
+              try:
+                  prompt = f"""Create a presentation outline for {topic} with {num_slides} slides.
+                  For each slide include:
+                  - A clear title
+                  - 3-5 bullet points
+                  - Speaker notes
+                  Format as JSON with structure:
+                  {{
+                      "slides": [
+                          {{
+                              "title": "slide title",
+                              "bullets": ["bullet 1", "bullet 2", "bullet 3"],
+                              "notes": "speaker notes"
+                          }}
+                      ]
+                  }}"""
+
+                  body = json.dumps({
+                      "prompt": f"\n\nHuman: {prompt}\n\nAssistant:",
+                      "max_tokens_to_sample": 2000,
+                      "temperature": 0.7,
+                      "top_p": 1,
+                      "stop_sequences": ["\n\nHuman:"]
+                  })
+
+                  # Call Bedrock API
+                  response = bedrock.invoke_model(
+                      modelId="anthropic.claude-v2",
+                      body=body,
+                      contentType="application/json"
+                  )
+
+                  # Parse response
+                  response_body = json.loads(response.get('body').read().decode())
+                  content = response_body.get('completion', '')
+
+                  # Parse JSON content
+                  try:
+                      # Find the JSON part in the response
+                      start_idx = content.find('{')
+                      end_idx = content.rfind('}') + 1
+                      if start_idx != -1 and end_idx != -1:
+                          json_str = content[start_idx:end_idx]
+                          slides_content = json.loads(json_str)
+                          return slides_content['slides']
+                      else:
+                          logger.warning("No JSON found in response")
+                          return []
+                  except json.JSONDecodeError as e:
+                      logger.warning(f"JSON decode error: {str(e)}")
+                      return []
+
+              except Exception as e:
+                  logger.error(f"Error generating content: {str(e)}")
+                  raise
+
+          def create_powerpoint(slides_content):
+              """Create PowerPoint presentation using python-pptx"""
+              try:
+                  # Create new presentation
+                  prs = Presentation()
+
+                  # Define slide layouts
+                  title_slide_layout = prs.slide_layouts[0]  # Title slide
+                  content_slide_layout = prs.slide_layouts[1]  # Content slide
+
+                  for idx, slide_data in enumerate(slides_content):
+                      # Add new slide
+                      if idx == 0:
+                          slide = prs.slides.add_slide(title_slide_layout)
+                          title = slide.shapes.title
+                          subtitle = slide.placeholders[1]
+                      else:
+                          slide = prs.slides.add_slide(content_slide_layout)
+                          title = slide.shapes.title
+                          body = slide.placeholders[1]
+
+                      # Add title
+                      title.text = slide_data.get('title', '')
+
+                      # Add content
+                      if idx == 0:
+                          # First slide - use subtitle
+                          subtitle.text = "\n".join(slide_data.get('bullets', []))
+                      else:
+                          # Content slides - use bullets
+                          tf = body.text_frame
+                          tf.clear()  # Clear default text
+                          
+                          for bullet in slide_data.get('bullets', []):
+                              p = tf.add_paragraph()
+                              p.text = bullet
+                              p.level = 0  # Main bullet level
+
+                      # Add notes if present
+                      if slide_data.get('notes'):
+                          notes_slide = slide.notes_slide
+                          notes_slide.notes_text_frame.text = slide_data['notes']
+
+                  # Save to memory stream
+                  memory_stream = io.BytesIO()
+                  prs.save(memory_stream)
+                  return memory_stream.getvalue()
+
+              except Exception as e:
+                  logger.error(f"Error creating PowerPoint: {str(e)}")
+                  raise
+
+          def lambda_handler(event, context):
+              try:
+                  # Parse input
+                  body = json.loads(event.get('body', '{}'))
+                  topic = body.get('topic', 'Default Topic')
+                  num_slides = body.get('numSlides', 5)
+                  
+                  logger.info(f"Generating presentation for topic: {topic}, slides: {num_slides}")
+
+                  # Generate content
+                  slides_content = generate_presentation_content(topic, num_slides)
+                  
+                  if not slides_content:
+                      raise ValueError("No content generated")
+
+                  # Create PowerPoint
+                  pptx_data = create_powerpoint(slides_content)
+
+                  # Generate unique filename
+                  timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                  filename = f"presentation_{timestamp}.pptx"
+
+                  # Upload to S3
+                  bucket_name = os.environ.get('STORAGE_BUCKET')
+                  if bucket_name:
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key=filename,
+                          Body=pptx_data,
+                          ContentType='application/vnd.openxmlformats-officedocument.presentationml.presentation'
+                      )
+
+                      # Generate presigned URL for download
+                      presigned_url = s3.generate_presigned_url('get_object',
+                          Params={'Bucket': bucket_name, 'Key': filename},
+                          ExpiresIn=3600  # URL expires in 1 hour
+                      )
+
+                  # Return response
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'message': 'Presentation generated successfully',
+                          'filename': filename,
+                          'downloadUrl': presigned_url,
+                          'content': slides_content,
+                          'fileData': base64.b64encode(pptx_data).decode('utf-8')
+                      })
+                  }
+
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'error': str(e),
+                          'content': slides_content if 'slides_content' in locals() else None
+                      })
+                  }
+      Environment:
+        Variables:
+          STORAGE_BUCKET: !Ref StorageBucketName
+      Timeout: 300
+      MemorySize: 1024
+
+  # API Gateway REST API
+  ApiGatewayRestApi:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: PresentationGeneratorAPI
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # API Gateway Resource and Method
+  ApiResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+      PathPart: generate
+
+  ApiMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      ResourceId: !Ref ApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PresentationGeneratorFunction.Arn}/invocations'
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn: ApiMethod
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+
+  # API Gateway Stage
+  ApiStage:
+    Type: 'AWS::ApiGateway::Stage'
+    Properties:
+      DeploymentId: !Ref ApiDeployment
+      RestApiId: !Ref ApiGatewayRestApi
+      StageName: prod
+
+  # Lambda Permission for API Gateway
+  LambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt PresentationGeneratorFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRestApi}/*/POST/generate'
+
+Outputs:
+  CloudFrontDomainName:
+    Description: 'CloudFront Distribution Domain Name'
+    Value: !GetAtt CloudFrontDistribution.DomainName
+  ApiEndpoint:
+    Description: 'API Gateway Endpoint'
+    Value: !Sub 'https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/generate'
