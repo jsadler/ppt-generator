@@ -58,3 +58,14 @@ This project deploys an AI-powered presentation generator using AWS CloudFormati
 aws cloudfront create-invalidation --distribution-id YOUR_DISTRIBUTION_ID --paths "/*"
 ```
 
+## Clean Up
+- To avoid incurring future charges, delete the resources:
+  1. Empty both S3 buckets
+  2. Delete the CloudFormation stack
+
+## Security
+### This template creates a secure deployment with:
+1. Private S3 buckets
+2. CloudFront Origin Access Control
+3. Appropriate IAM roles and policies
+4. HTTPS-only access
